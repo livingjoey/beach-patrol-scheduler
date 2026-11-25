@@ -1,0 +1,27 @@
+{
+  "name": "beach-patrol-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Beach Patrol Scheduler: the web app and the small server that hosts it and stores its data.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.ts",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.ts",
+    "seed": "node --disable-warning=ExperimentalWarning src/db/seed.ts",
+    "seed:demo": "node --disable-warning=ExperimentalWarning src/db/seed.ts --demo",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "build:web": "node web/build.mjs node_modules/.bin/esbuild"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.0",
+    "esbuild": "^0.25.0"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  }
+}

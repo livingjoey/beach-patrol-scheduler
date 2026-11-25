@@ -1,0 +1,25 @@
+# Render Blueprint for the Beach Patrol Scheduler.
+# One small always-on web service with a 1 GB disk for the database.
+services:
+  - type: web
+    name: beach-patrol-scheduler
+    runtime: node
+    plan: 0.5c-512mb          # smallest paid instance (a disk can't be attached to a free service)
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    disk:
+      name: scheduler-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "24.22.1"
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /var/data/beach-patrol.db
+      - key: AUTH_SECRET        # signs sign-in sessions; generated once by Render
+        generateValue: true
+      - key: SETUP_CODE         # needed once, on the first-time setup screen
+        generateValue: true
