@@ -1,193 +1,117 @@
-// Saved criteria presets, certification list and equivalency rules.
+// Certification criteria engine.
+//
+// A rule is a tree:
+//   { "cert": "EMT" }                      lifeguard holds EMT
+//   { "any": [rule, rule, …] }             ANY / OR  – at least one child is true
+//   { "all": [rule, rule, …] }             ALL / AND – every child is true
+//
+// Example: (EMT or EMT2 or PMD) and PWC3
+//   { "all": [ { "any": [{"cert":"EMT"},{"cert":"EMT2"},{"cert":"PMD"}] }, { "cert": "PWC3" } ] }
+//
+// A bare string "EMT" is accepted as shorthand for { "cert": "EMT" }.
+// An empty { "all": [] } means "no requirement".
+// No certification implies another. Equivalencies apply only when explicitly enabled.
 
-import { describe, evaluate, type Rule } from '../../../src/domain/criteria.ts';
-import { rerender } from '../app-state.ts';
-import { me, personnelCtx, sortedAssignments } from '../model.ts';
-import { audit, deletePreset, saveAssignment, saveCerts, savePreset, state, StoreError, type Preset } from '../store.ts';
-import { $, $$, html, icon, modal, newId, raw, toast, type Raw } from '../util.ts';
-import { mountRuleBuilder } from './rule-builder.ts';
+export type Rule = { cert: string } | { all: Rule[] } | { any: Rule[] };
 
-const local = { selected: null as number | null, draft: null as null | { id: number; name: string; rule: Rule } };
-
-function usage(id: number): string[] {
-  const out: string[] = [];
-  for (const a of sortedAssignments())
-    a.slots.forEach((s) => {
-      if (s.mode === 'preset' && s.presetId === id) out.push(`${a.displayName} · ${s.name} (override)`);
-      else if (s.mode === 'default' && a.defaultPresetId === id) out.push(`${a.displayName} · ${s.name}`);
-    });
-  return out;
+export interface Equivalency {
+  holder: string;
+  satisfies: string;
 }
 
-async function run(fn: () => Promise<unknown>, ok?: string) {
-  try {
-    await fn();
-    if (ok) toast(ok);
-  } catch (e) {
-    toast(e instanceof StoreError ? e.message : 'Could not save.', 'error');
+export class RuleError extends Error {
+  path: string;
+  constructor(message: string, path: string) {
+    super(`${message} (at ${path})`);
+    this.path = path;
   }
 }
 
-function editor(p: Preset): Raw {
-  const d = local.draft?.id === p.id ? local.draft : { id: p.id, name: p.name, rule: p.rule };
-  local.draft = d;
-  const people = [...personnelCtx().values()].filter((x) => x.active);
-  const who = people.filter((x) => evaluate(d.rule, x.certs));
-  const used = usage(p.id);
-  const dirty = d.name !== p.name || JSON.stringify(d.rule) !== JSON.stringify(p.rule);
-  return html`<section class="detail" aria-label="Preset editor">
-    <div class="profile-head">
-      <label class="field grow1"><span class="eyebrow">Preset name</span><input id="c-name" class="input big" value="${d.name}" maxlength="80"></label>
-      <button type="button" class="btn" id="c-dup">Duplicate</button>
-      <button type="button" class="btn primary" id="c-save" ${dirty ? '' : raw('disabled')}>${dirty ? 'Save preset' : 'Saved'}</button>
-    </div>
-    <div class="cards2 wide-left">
-      <section class="card"><h3 class="h3">A lifeguard qualifies when they have</h3><div id="c-rb"></div></section>
-      <div class="stack">
-        <section class="card"><div class="card-head"><h3 class="h3">Who qualifies now</h3><span><strong class="mono big-num">${who.length}</strong> <span class="muted small">of ${people.length} active</span></span></div>
-          <div class="lg-wrap">${who.slice(0, 60).map((x) => html`<span class="chip lc-${x.labelColor}">${x.lgNumber}</span>`)}${who.length > 60 ? html`<span class="muted small">+${who.length - 60} more</span>` : ''}</div>
-          <p class="muted small">Updates as you edit the rule.</p></section>
-        <section class="card"><h3 class="h3">Used by ${used.length} slot${used.length === 1 ? '' : 's'}</h3>
-          ${used.length ? html`<ul class="plain">${used.slice(0, 20).map((u) => html`<li><a href="#assignments">${u}</a></li>`)}${used.length > 20 ? html`<li class="muted small">…and ${used.length - 20} more</li>` : ''}</ul>` : html`<p class="muted small">Not used yet. Pick it in Assignment settings.</p>`}
-          <p class="muted small">Saving changes these slots. Slots with a custom rule are not affected.</p></section>
-      </div>
-    </div>
-    <div class="danger-row"><button type="button" class="btn small ghost danger" id="c-del">${icon('trash', 13)} Delete preset</button></div>
-  </section>`;
+const MAX_DEPTH = 5;
+const MAX_ITEMS = 50;
+
+export function parseRule(input: unknown, knownCerts: ReadonlySet<string>, path = 'rule', depth = 0): Rule {
+  if (depth > MAX_DEPTH) throw new RuleError(`Rules can be nested at most ${MAX_DEPTH} levels`, path);
+  if (typeof input === 'string') input = { cert: input };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new RuleError('Expected a rule object: {cert}, {any:[…]} or {all:[…]}', path);
+  }
+  const o = input as Record<string, unknown>;
+  const keys = Object.keys(o);
+  if (keys.length !== 1) throw new RuleError('A rule must have exactly one of: cert, any, all', path);
+  if ('cert' in o) {
+    if (typeof o.cert !== 'string') throw new RuleError('cert must be a string', path);
+    const code = o.cert.trim().toUpperCase();
+    if (!knownCerts.has(code)) throw new RuleError(`Unknown certification "${o.cert}"`, path);
+    return { cert: code };
+  }
+  const op = 'any' in o ? 'any' : 'all' in o ? 'all' : null;
+  if (!op) throw new RuleError('A rule must have exactly one of: cert, any, all', path);
+  const items = o[op];
+  if (!Array.isArray(items)) throw new RuleError(`${op} must be an array`, path);
+  if (items.length > MAX_ITEMS) throw new RuleError(`A group can hold at most ${MAX_ITEMS} items`, path);
+  if (op === 'any' && items.length === 0) throw new RuleError('An ANY group needs at least one item', path);
+  if (op === 'all' && items.length === 0 && depth > 0) throw new RuleError('An ALL group needs at least one item', path);
+  const children = items.map((it, i) => parseRule(it, knownCerts, `${path}.${op}[${i}]`, depth + 1));
+  return op === 'any' ? { any: children } : { all: children };
 }
 
-function equivalencies(): Raw {
-  const eqs = state.certs?.equivalencies ?? [];
-  const certs = state.certs?.list ?? [];
-  return html`<section class="card">
-    <div class="card-head"><h3 class="h3">Certification equivalencies</h3><span class="muted small grow1">Off by default. No certification counts as another unless you add a rule here and switch it on. Applies everywhere.</span></div>
-    ${eqs.map(
-      (e, i) => html`<div class="eq-row"><span class="rb-cert solid">${e.holder}</span><span>also counts as</span><span class="rb-cert solid">${e.satisfies}</span><span class="grow1"></span>
-        <label class="switch"><input type="checkbox" data-eq="${i}" ${e.enabled ? raw('checked') : ''}><span class="track" aria-hidden="true"></span>${e.enabled ? 'On' : 'Off'}</label>
-        <button type="button" class="icon-btn" data-eq-del="${i}" aria-label="Remove rule">${icon('trash', 14)}</button></div>`,
-    )}
-    <div class="eq-add"><select id="eq-h" class="input small" aria-label="Holding">${certs.map((c) => html`<option value="${c.code}">${c.name}</option>`)}</select><span>also counts as</span><select id="eq-s" class="input small" aria-label="Counts as">${certs.map((c) => html`<option value="${c.code}">${c.name}</option>`)}</select><button type="button" class="btn small" id="eq-add">${icon('plus', 13)} Add rule</button></div>
-  </section>
-  <section class="card">
-    <div class="card-head"><h3 class="h3">Certifications</h3><span class="muted small grow1">Shown as toggles on every personnel profile.</span></div>
-    <div class="cert-row">${certs.map((c) => html`<span class="rb-cert solid">${c.name}</span>`)}</div>
-    <div class="eq-add"><input id="nc-code" class="input small mono" placeholder="New code, e.g. CPR" maxlength="16" aria-label="New certification code"><button type="button" class="btn small" id="nc-add">${icon('plus', 13)} Add certification</button></div>
-  </section>`;
-}
-
-export const criteriaView = {
-  render(): Raw {
-    const presets = [...state.presets.values()].sort((a, b) => a.name.localeCompare(b.name));
-    if (local.selected == null || !state.presets.has(local.selected)) local.selected = presets[0]?.id ?? null;
-    const p = local.selected != null ? state.presets.get(local.selected) : undefined;
-    return html`<div class="master">
-      <aside class="list-pane" aria-label="Saved presets">
-        <div class="pane-head"><h1 class="h1">Criteria presets</h1><button type="button" class="btn primary small" id="c-new">${icon('plus', 14)} New</button></div>
-        <div class="plist">${presets.map(
-          (x) => html`<button type="button" class="preitem${x.id === local.selected ? ' on' : ''}" data-cid="${x.id}"><strong>${x.name}</strong><span class="small">${describe(x.rule)}</span><span class="muted small">${usage(x.id).length} slots</span></button>`,
-        )}</div>
-        <p class="info small">Preset names and rules are yours to define. The starting six are examples.</p>
-      </aside>
-      <div class="detail-col">${p ? editor(p) : html`<section class="detail"><div class="empty-state"><p>No presets yet.</p></div></section>`}<div class="detail pad-top">${equivalencies()}</div></div>
-    </div>`;
-  },
-  bind(root: HTMLElement): void {
-    $$('[data-cid]', root).forEach((b) => (b.onclick = () => ((local.selected = Number(b.dataset.cid)), (local.draft = null), rerender(true))));
-    $('#c-new', root)!.onclick = () => {
-      const p: Preset = { id: newId(), name: `New preset ${state.presets.size + 1}`, rule: { all: [{ cert: 'BASIC' }] }, description: '' };
-      run(() => savePreset(p), 'Preset created.');
-      local.selected = p.id;
-      local.draft = null;
-    };
-    const p = local.selected != null ? state.presets.get(local.selected) : undefined;
-    if (p && local.draft) {
-      const btn = $('#c-save', root) as HTMLButtonElement;
-      const refresh = () => {
-        const dirty = local.draft!.name !== p.name || JSON.stringify(local.draft!.rule) !== JSON.stringify(p.rule);
-        btn.disabled = !dirty;
-        btn.textContent = dirty ? 'Save preset' : 'Saved';
-      };
-      mountRuleBuilder($('#c-rb', root)!, local.draft.rule, (rule) => {
-        local.draft!.rule = rule;
-        refresh();
-        // update qualifying count without losing builder state
-        const people = [...personnelCtx().values()].filter((x) => x.active);
-        const n = people.filter((x) => evaluate(rule, x.certs));
-        const num = $('.big-num', root);
-        if (num) num.textContent = String(n.length);
-        const wrap = $('.lg-wrap', root);
-        if (wrap) wrap.innerHTML = html`${n.slice(0, 60).map((x) => html`<span class="chip lc-${x.labelColor}">${x.lgNumber}</span>`)}${n.length > 60 ? html`<span class="muted small">+${n.length - 60} more</span>` : ''}`.value;
-      });
-      ($('#c-name', root) as HTMLInputElement).oninput = (e) => ((local.draft!.name = (e.target as HTMLInputElement).value), refresh());
-      btn.onclick = async () => {
-        const name = local.draft!.name.trim();
-        if (!name) return toast('Enter a preset name.', 'warn');
-        if ([...state.presets.values()].some((x) => x.id !== p.id && x.name.toLowerCase() === name.toLowerCase())) return toast('Another preset already has that name.', 'warn');
-        await run(() => savePreset({ ...p, name, rule: local.draft!.rule }), `Saved “${name}”.`);
-        audit(me(), 'Saved preset', `${name}: ${describe(local.draft!.rule)}`);
-        local.draft = null;
-      };
-      $('#c-dup', root)!.onclick = () => {
-        const np: Preset = { id: newId(), name: `${p.name} (copy)`, rule: local.draft!.rule, description: '' };
-        run(() => savePreset(np), 'Duplicated.');
-        local.selected = np.id;
-        local.draft = null;
-      };
-      $('#c-del', root)!.onclick = () => {
-        const used = usage(p.id);
-        modal(
-          html`<h2 class="h2">Delete “${p.name}”?</h2><p>${used.length ? `${used.length} slots use it. They will fall back to their assignment default, or to no requirement.` : 'No slots use it.'}</p><div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn danger" id="cd-go">Delete</button></div>`,
-          (r, close) => {
-            ($('#cd-go', r) as HTMLButtonElement).onclick = async () => {
-              close();
-              try {
-                for (const a of sortedAssignments()) {
-                  if (!a.slots.some((s) => s.presetId === p.id) && a.defaultPresetId !== p.id) continue;
-                  const next = JSON.parse(JSON.stringify(a));
-                  if (next.defaultPresetId === p.id) next.defaultPresetId = null;
-                  next.slots = next.slots.map((s: { mode: string; presetId: number | null }) => (s.mode === 'preset' && s.presetId === p.id ? { ...s, mode: 'default', presetId: null } : s));
-                  await saveAssignment(next);
-                }
-                await deletePreset(p.id);
-                audit(me(), 'Deleted preset', p.name);
-                local.selected = null;
-                local.draft = null;
-                toast('Preset deleted.');
-              } catch (e) {
-                toast(e instanceof StoreError ? e.message : 'Could not delete.', 'error');
-              }
-            };
-          },
-        );
-      };
+/** Held certifications plus anything granted by enabled equivalencies (transitively). */
+export function effectiveCerts(held: Iterable<string>, equivalencies: readonly Equivalency[]): Set<string> {
+  const out = new Set(held);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const e of equivalencies) {
+      if (out.has(e.holder) && !out.has(e.satisfies)) {
+        out.add(e.satisfies);
+        changed = true;
+      }
     }
+  }
+  return out;
+}
 
-    // equivalencies & certifications
-    const certs = state.certs;
-    if (!certs) return;
-    $$<HTMLInputElement>('[data-eq]', root).forEach(
-      (c) =>
-        (c.onchange = () => {
-          const i = Number(c.dataset.eq);
-          const equivalencies = certs.equivalencies.map((e, j) => (j === i ? { ...e, enabled: c.checked } : e));
-          run(() => saveCerts({ ...certs, equivalencies }), c.checked ? `${equivalencies[i].holder} now counts as ${equivalencies[i].satisfies}.` : 'Rule switched off.');
-          audit(me(), 'Changed equivalency', `${equivalencies[i].holder} → ${equivalencies[i].satisfies}: ${c.checked ? 'on' : 'off'}`);
-        }),
-    );
-    $$('[data-eq-del]', root).forEach((b) => (b.onclick = () => run(() => saveCerts({ ...certs, equivalencies: certs.equivalencies.filter((_, j) => j !== Number(b.dataset.eqDel)) }), 'Rule removed.')));
-    $('#eq-add', root)!.onclick = () => {
-      const holder = ($('#eq-h', root) as HTMLSelectElement).value;
-      const satisfies = ($('#eq-s', root) as HTMLSelectElement).value;
-      if (holder === satisfies) return toast('Pick two different certifications.', 'warn');
-      if (certs.equivalencies.some((e) => e.holder === holder && e.satisfies === satisfies)) return toast('That rule already exists.', 'warn');
-      run(() => saveCerts({ ...certs, equivalencies: [...certs.equivalencies, { holder, satisfies, enabled: false }] }), 'Rule added (off). Switch it on to apply it.');
-    };
-    $('#nc-add', root)!.onclick = () => {
-      const code = ($('#nc-code', root) as HTMLInputElement).value.trim().toUpperCase();
-      if (!/^[A-Z0-9][A-Z0-9_-]{0,15}$/.test(code)) return toast('Use letters, digits, - or _ (up to 16).', 'warn');
-      if (certs.list.some((c) => c.code === code)) return toast('That certification already exists.', 'warn');
-      run(() => saveCerts({ ...certs, list: [...certs.list, { code, name: code }] }), `${code} added.`);
-      audit(me(), 'Added certification type', code);
-    };
-  },
-};
+export function evaluate(rule: Rule | null, certs: ReadonlySet<string>): boolean {
+  if (!rule) return true;
+  if ('cert' in rule) return certs.has(rule.cert);
+  if ('any' in rule) return rule.any.some((r) => evaluate(r, certs));
+  return rule.all.every((r) => evaluate(r, certs));
+}
+
+/** Plain-language summary, e.g. "(EMT or EMT2 or PMD) and PWC3". */
+export function describe(rule: Rule | null): string {
+  if (!rule || ('all' in rule && rule.all.length === 0)) return 'No requirement';
+  return describeInner(rule, null);
+}
+
+function describeInner(rule: Rule, parent: 'any' | 'all' | null): string {
+  if ('cert' in rule) return rule.cert;
+  const op = 'any' in rule ? 'any' : 'all';
+  const items = 'any' in rule ? rule.any : rule.all;
+  if (items.length === 1) return describeInner(items[0], parent);
+  const text = items.map((r) => describeInner(r, op)).join(op === 'any' ? ' or ' : ' and ');
+  return parent && parent !== op ? `(${text})` : text;
+}
+
+/** Which parts of the rule a lifeguard is missing, in plain language. Empty when qualified. */
+export function missing(rule: Rule | null, certs: ReadonlySet<string>): string[] {
+  if (!rule || evaluate(rule, certs)) return [];
+  if ('all' in rule) return rule.all.filter((r) => !evaluate(r, certs)).map((r) => describeNeed(r));
+  return [describeNeed(rule)];
+}
+
+function describeNeed(rule: Rule): string {
+  if ('cert' in rule) return rule.cert;
+  if ('any' in rule && rule.any.every((r) => 'cert' in r)) {
+    return `one of ${rule.any.map((r) => (r as { cert: string }).cert).join(', ')}`;
+  }
+  return describe(rule);
+}
+
+export function certsInRule(rule: Rule | null, out = new Set<string>()): Set<string> {
+  if (!rule) return out;
+  if ('cert' in rule) out.add(rule.cert);
+  else for (const r of 'any' in rule ? rule.any : rule.all) certsInRule(r, out);
+  return out;
+}

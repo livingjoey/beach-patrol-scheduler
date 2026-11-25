@@ -1,273 +1,384 @@
-// Assignment directory and per-assignment configuration with modular staffing slots.
+// Assignment directory (stands, squads, skis, boats, extras), staffing slots and saved criteria presets.
 
-import { describe, evaluate, type Rule } from '../../../src/domain/criteria.ts';
-import type { AssignmentKind } from '../../../src/domain/scheduling.ts';
-import { rerender } from '../app-state.ts';
-import { me, personnelCtx, resolvedSlots, sortedAssignments } from '../model.ts';
-import { audit, deleteAssignment, saveAssignment, savePreset, state, StoreError, type AssignmentDef, type SlotDef } from '../store.ts';
-import { $, $$, html, icon, modal, newId, raw, toast, type Raw } from '../util.ts';
-import { mountRuleBuilder } from './rule-builder.ts';
+import { all, audit, bool, get, run, tx, type DB } from '../db/index.ts';
+import { describe, evaluate, parseRule, type Rule } from '../domain/criteria.ts';
+import { todayIso } from '../domain/dates.ts';
+import { ADMIN, created, HttpError, type Router } from '../http/app.ts';
+import { bad, has, idParam, int, notFound, obj, oneOf, optBool, optInt, optOneOf, optStr, str, TIME, type Body } from '../http/validate.ts';
+import { knownCertCodes, loadAssignments, loadPersonnel, loadPresets } from '../services/context.ts';
 
-const GROUPS: { kind: AssignmentKind; label: string }[] = [
-  { kind: 'stand', label: 'Stands' },
-  { kind: 'medical', label: 'Medical units' },
-  { kind: 'pwc', label: 'PWC units' },
-  { kind: 'boat', label: 'Boats' },
-  { kind: 'extra', label: 'Extras · renameable' },
-];
-const local = { selected: null as number | null };
+export const KINDS = ['stand', 'medical', 'pwc', 'boat', 'extra'] as const;
 
-async function save(a: AssignmentDef, msg?: string) {
+// ---------- helpers ----------
+
+function ruleFrom(db: DB, raw: unknown, field = 'rule'): Rule {
   try {
-    await saveAssignment(a);
-    if (msg) toast(msg);
+    return parseRule(raw, knownCertCodes(db), field);
   } catch (e) {
-    toast(e instanceof StoreError ? e.message : 'Could not save.', 'error');
+    throw new HttpError(400, 'invalid_rule', (e as Error).message, { field });
   }
 }
 
-const clone = (a: AssignmentDef): AssignmentDef => JSON.parse(JSON.stringify(a));
+type Criteria = { mode: 'default' } | { mode: 'preset'; presetId: number } | { mode: 'custom'; rule: Rule };
 
-function directory(): Raw {
-  const all = sortedAssignments();
-  return html`<aside class="list-pane" aria-label="Assignment directory">
-    <div class="pane-head"><h1 class="h1">Assignments</h1><button type="button" class="btn primary small" id="add-asg">${icon('plus', 14)} Add</button></div>
-    <p class="muted small">${all.length} total · ${all.filter((a) => a.active).length} active</p>
-    <div class="plist" data-keep-scroll="alist">${GROUPS.map((g) => {
-      const items = all.filter((a) => a.kind === g.kind);
-      if (!items.length) return '';
-      return html`<div class="grp">${g.label}</div>${items.map(
-        (a) => html`<button type="button" class="aitem${a.id === local.selected ? ' on' : ''}${a.active ? '' : ' inactive'}" data-aid="${a.id}"><span class="ind${a.active ? '' : ' no'}" aria-hidden="true"></span><span class="grow1">${a.displayName}</span><span class="mono small muted">${a.slots.length}</span></button>`,
-      )}`;
-    })}</div>
-  </aside>`;
+function parseCriteria(db: DB, raw: unknown): Criteria {
+  const c = obj(raw, 'criteria');
+  const mode = oneOf(c, 'mode', ['default', 'preset', 'custom'] as const);
+  if (mode === 'preset') {
+    const presetId = int(c, 'presetId', { min: 1 });
+    if (!get(db, 'SELECT id FROM criteria_presets WHERE id = ?', presetId)) throw notFound('Criteria preset');
+    return { mode, presetId };
+  }
+  if (mode === 'custom') return { mode, rule: ruleFrom(db, c.rule, 'criteria.rule') };
+  return { mode };
 }
 
-function detail(a: AssignmentDef): Raw {
-  const presets = [...state.presets.values()].sort((x, y) => x.name.localeCompare(y.name));
-  const def = a.defaultPresetId != null ? state.presets.get(a.defaultPresetId) : undefined;
-  const resolved = resolvedSlots().slots;
-  const people = [...personnelCtx().values()].filter((p) => p.active);
-  return html`<section class="detail" aria-label="${a.displayName} settings">
-    <div class="profile-head">
-      <div class="grow1"><div class="eyebrow">${GROUPS.find((g) => g.kind === a.kind)?.label.replace(' · renameable', '')}</div><h2 class="h1">${a.displayName}</h2></div>
-      <label class="switch"><input type="checkbox" id="a-active" ${a.active ? raw('checked') : ''}><span class="track" aria-hidden="true"></span>Active (shows on the schedule)</label>
-    </div>
-    <section class="card form-grid">
-      <label class="field"><span>Display name</span><input id="a-name" class="input" value="${a.displayName}" maxlength="60"></label>
-      <label class="field"><span>Default criteria for its slots</span><select id="a-def" class="input"><option value="">No requirement</option>${presets.map((p) => html`<option value="${p.id}" ${p.id === a.defaultPresetId ? raw('selected') : ''}>${p.name}</option>`)}</select></label>
-      <label class="field"><span>Default status on the schedule</span><select id="a-open" class="input"><option value="1" ${a.openByDefault ? raw('selected') : ''}>Open every day</option><option value="0" ${a.openByDefault ? '' : raw('selected')}>Closed every day</option></select></label>
-      <div class="field"><span>Shift times (optional, for overlap checks)</span><div class="row2 fixed"><input id="a-start" type="time" class="input" value="${a.startTime ?? ''}" aria-label="Start time"><input id="a-end" type="time" class="input" value="${a.endTime ?? ''}" aria-label="End time"></div></div>
-    </section>
-    <section class="card flush">
-      <div class="card-head pad"><h3 class="h3">Staffing slots</h3><span class="count mono">${a.slots.length}</span><span class="muted small grow1">Each slot can use the default${def ? ` (${def.name})` : ''}, a saved preset, or its own rule.</span>
-        <select id="a-apply" class="input small" aria-label="Apply a preset to every slot"><option value="">Apply to all slots…</option><option value="default">Use the default</option>${presets.map((p) => html`<option value="${p.id}">${p.name}</option>`)}</select></div>
-      <div class="table-wrap"><table class="tbl slots-tbl">
-        <thead><tr><th scope="col"><span class="sr">Order</span></th><th scope="col">#</th><th scope="col">Slot name</th><th scope="col">Criteria</th><th scope="col">Qualified</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
-        <tbody>${a.slots.map((s, i) => {
-          const r = resolved.get(s.id);
-          const q = r ? people.filter((p) => evaluate(r.rule, p.certs)).length : 0;
-          const tag = s.mode === 'default' ? html`<span class="tag def">Default</span>` : s.mode === 'preset' ? html`<span class="tag ovr">Override</span>` : html`<span class="tag cus">Custom</span>`;
-          return html`<tr>
-            <td class="nowrap"><button type="button" class="icon-btn" data-up="${i}" aria-label="Move ${s.name} up" ${i === 0 ? raw('disabled') : ''}>${icon('up', 14)}</button><button type="button" class="icon-btn" data-down="${i}" aria-label="Move ${s.name} down" ${i === a.slots.length - 1 ? raw('disabled') : ''}>${icon('down', 14)}</button></td>
-            <td class="mono muted">${i + 1}</td>
-            <td><input class="input" data-sname="${i}" value="${s.name}" maxlength="40" aria-label="Slot ${i + 1} name"></td>
-            <td><div class="crit-cell"><select class="input" data-scrit="${i}" aria-label="Criteria for ${s.name}">
-                <option value="default" ${s.mode === 'default' ? raw('selected') : ''}>Default${def ? ` · ${def.name}` : ' · none'}</option>
-                ${presets.map((p) => html`<option value="p${p.id}" ${s.mode === 'preset' && s.presetId === p.id ? raw('selected') : ''}>${p.name}</option>`)}
-                <option value="custom" ${s.mode === 'custom' ? raw('selected') : ''}>Custom rule for this slot…</option>
-              </select>${tag}</div><div class="muted small">${r?.ruleText ?? ''}</div></td>
-            <td class="mono">${q}<span class="muted"> of ${people.length}</span></td>
-            <td class="nowrap">
-              ${s.mode === 'custom' ? html`<button type="button" class="btn tiny" data-edit="${i}">Edit rule</button><button type="button" class="btn tiny" data-savepreset="${i}">Save as preset</button>` : ''}
-              <button type="button" class="icon-btn" data-remove="${i}" aria-label="Remove ${s.name}">${icon('trash', 14)}</button>
-            </td></tr>`;
-        })}</tbody></table></div>
-      <div class="card-foot pad"><button type="button" class="btn small dashed" id="add-slot">${icon('plus', 13)} Add slot</button><span class="muted small">New slots use the default criteria.</span></div>
-    </section>
-    <p class="info small">${icon('check', 13)} <span><strong>Override</strong> = this slot uses a different saved preset. <strong>Custom</strong> = a one-off rule only this slot uses. Editing a preset updates every slot that uses it; custom rules are left alone.</span></p>
-    <div class="danger-row"><button type="button" class="btn small ghost danger" id="a-del">${icon('trash', 13)} Delete ${a.displayName}</button><span class="muted small">Or turn off Active to hide it from the schedule.</span></div>
-  </section>`;
-}
-
-export const assignmentsView = {
-  render(): Raw {
-    if (local.selected == null || !state.assignments.has(local.selected)) local.selected = sortedAssignments()[0]?.id ?? null;
-    const a = local.selected != null ? state.assignments.get(local.selected) : undefined;
-    return html`<div class="master">${directory()}${a ? detail(a) : html`<section class="detail"><div class="empty-state"><p>No assignments yet.</p></div></section>`}</div>`;
-  },
-  bind(root: HTMLElement): void {
-    $$('[data-aid]', root).forEach((b) => (b.onclick = () => ((local.selected = Number(b.dataset.aid)), rerender(true))));
-    $('#add-asg', root)!.onclick = addAssignment;
-    const cur = local.selected != null ? state.assignments.get(local.selected) : undefined;
-    if (!cur) return;
-    const edit = (fn: (a: AssignmentDef) => void, msg?: string) => {
-      const a = clone(state.assignments.get(cur.id)!);
-      fn(a);
-      save(a, msg);
-    };
-    ($('#a-active', root) as HTMLInputElement).onchange = (e) => {
-      const on = (e.target as HTMLInputElement).checked;
-      edit((a) => (a.active = on), on ? `${cur.displayName} is active.` : `${cur.displayName} hidden from the schedule.`);
-      audit(me(), on ? 'Activated assignment' : 'Deactivated assignment', cur.displayName);
-    };
-    ($('#a-name', root) as HTMLInputElement).onchange = (e) => {
-      const v = (e.target as HTMLInputElement).value.trim();
-      if (!v) return;
-      edit((a) => (a.displayName = v), 'Renamed.');
-      audit(me(), 'Renamed assignment', `${cur.displayName} → ${v}`);
-    };
-    ($('#a-def', root) as HTMLSelectElement).onchange = (e) => edit((a) => (a.defaultPresetId = (e.target as HTMLSelectElement).value ? Number((e.target as HTMLSelectElement).value) : null), 'Default criteria saved.');
-    ($('#a-open', root) as HTMLSelectElement).onchange = (e) => edit((a) => (a.openByDefault = (e.target as HTMLSelectElement).value === '1'), 'Saved.');
-    ($('#a-start', root) as HTMLInputElement).onchange = (e) => edit((a) => (a.startTime = (e.target as HTMLInputElement).value || null), 'Shift time saved.');
-    ($('#a-end', root) as HTMLInputElement).onchange = (e) => edit((a) => (a.endTime = (e.target as HTMLInputElement).value || null), 'Shift time saved.');
-    ($('#a-apply', root) as HTMLSelectElement).onchange = (e) => {
-      const v = (e.target as HTMLSelectElement).value;
-      if (!v) return;
-      edit((a) => (a.slots = a.slots.map((s) => (v === 'default' ? { ...s, mode: 'default', presetId: null, rule: null } : { ...s, mode: 'preset', presetId: Number(v), rule: null }))), 'Applied to every slot.');
-    };
-    $$('[data-up]', root).forEach((b) => (b.onclick = () => edit((a) => move(a.slots, Number(b.dataset.up), -1))));
-    $$('[data-down]', root).forEach((b) => (b.onclick = () => edit((a) => move(a.slots, Number(b.dataset.down), 1))));
-    $$<HTMLInputElement>('[data-sname]', root).forEach(
-      (inp) =>
-        (inp.onchange = () => {
-          const v = inp.value.trim();
-          if (v) edit((a) => (a.slots[Number(inp.dataset.sname)].name = v), 'Slot renamed.');
-        }),
-    );
-    $$<HTMLSelectElement>('[data-scrit]', root).forEach(
-      (sel) =>
-        (sel.onchange = () => {
-          const i = Number(sel.dataset.scrit);
-          const v = sel.value;
-          if (v === 'custom') return editRule(cur.id, i);
-          edit((a) => (a.slots[i] = { ...a.slots[i], mode: v === 'default' ? 'default' : 'preset', presetId: v === 'default' ? null : Number(v.slice(1)), rule: null }), 'Slot criteria saved.');
-        }),
-    );
-    $$('[data-edit]', root).forEach((b) => (b.onclick = () => editRule(cur.id, Number(b.dataset.edit))));
-    $$('[data-savepreset]', root).forEach((b) => (b.onclick = () => saveAsPreset(cur.id, Number(b.dataset.savepreset))));
-    $$('[data-remove]', root).forEach(
-      (b) =>
-        (b.onclick = () => {
-          const i = Number(b.dataset.remove);
-          edit((a) => a.slots.splice(i, 1), `${cur.slots[i].name} removed.`);
-          audit(me(), 'Removed slot', `${cur.displayName} · ${cur.slots[i].name}`);
-        }),
-    );
-    $('#add-slot', root)!.onclick = () => {
-      edit((a) => a.slots.push({ id: newId(), name: `Slot ${a.slots.length + 1}`, mode: 'default', presetId: null, rule: null }), 'Slot added.');
-      audit(me(), 'Added slot', cur.displayName);
-    };
-    $('#a-del', root)!.onclick = () =>
-      modal(html`<h2 class="h2">Delete ${cur.displayName}?</h2><p>Its slots and any assignments to them disappear from every week. To keep history, turn off Active instead.</p><div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn danger" id="ad-go">Delete</button></div>`, (r, close) => {
-        ($('#ad-go', r) as HTMLButtonElement).onclick = async () => {
-          close();
-          try {
-            await deleteAssignment(cur.id);
-            audit(me(), 'Deleted assignment', cur.displayName);
-            local.selected = null;
-            toast(`${cur.displayName} deleted.`);
-          } catch (e) {
-            toast(e instanceof StoreError ? e.message : 'Could not delete.', 'error');
-          }
-        };
-      });
-  },
-};
-
-function move(list: SlotDef[], i: number, d: number) {
-  const j = i + d;
-  if (j < 0 || j >= list.length) return;
-  [list[i], list[j]] = [list[j], list[i]];
-}
-
-function editRule(aid: number, i: number) {
-  const a = state.assignments.get(aid)!;
-  const slot = a.slots[i];
-  const start = slot.mode === 'custom' ? slot.rule : resolvedSlots().slots.get(slot.id)?.rule ?? null;
-  let rule: Rule = start ?? { all: [] };
-  modal(
-    html`<h2 class="h2">Custom rule · ${a.displayName} · ${slot.name}</h2><p class="muted small">Only this slot uses it. Other slots keep their criteria.</p><div id="rb"></div><p class="muted small" id="rb-count"></p>
-      <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn primary" id="rb-save">Save rule</button></div>`,
-    (root, close) => {
-      const people = [...personnelCtx().values()].filter((p) => p.active);
-      const count = () => ($('#rb-count', root)!.textContent = `${people.filter((p) => evaluate(rule, p.certs)).length} of ${people.length} active lifeguards qualify.`);
-      mountRuleBuilder($('#rb', root)!, start, (r) => ((rule = r), count()));
-      count();
-      ($('#rb-save', root) as HTMLButtonElement).onclick = () => {
-        close();
-        const next = clone(state.assignments.get(aid)!);
-        next.slots[i] = { ...next.slots[i], mode: 'custom', presetId: null, rule };
-        save(next, `Custom rule saved: ${describe(rule)}.`);
-        audit(me(), 'Set custom slot rule', `${a.displayName} · ${slot.name}: ${describe(rule)}`);
-      };
-    },
-    true,
+function writeCriteria(db: DB, slotId: number, c: Criteria): void {
+  run(
+    db,
+    'UPDATE slots SET criteria_mode = ?, preset_id = ?, custom_rule_json = ? WHERE id = ?',
+    c.mode,
+    c.mode === 'preset' ? c.presetId : null,
+    c.mode === 'custom' ? JSON.stringify(c.rule) : null,
+    slotId,
   );
 }
 
-function saveAsPreset(aid: number, i: number) {
-  const a = state.assignments.get(aid)!;
-  const slot = a.slots[i];
-  if (!slot.rule) return;
-  modal(
-    html`<h2 class="h2">Save as a reusable preset</h2><p class="muted">${describe(slot.rule)}</p><label class="field"><span>Preset name</span><input id="sp-name" class="input" maxlength="80" autofocus></label><p class="error" id="sp-err" hidden></p>
-      <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn primary" id="sp-go">Save preset</button></div>`,
-    (root, close) => {
-      ($('#sp-go', root) as HTMLButtonElement).onclick = async () => {
-        const name = ($('#sp-name', root) as HTMLInputElement).value.trim();
-        const err = $('#sp-err', root)!;
-        if (!name) return ((err.textContent = 'Enter a name.'), (err.hidden = false));
-        if ([...state.presets.values()].some((p) => p.name.toLowerCase() === name.toLowerCase())) return ((err.textContent = 'A preset with that name already exists.'), (err.hidden = false));
-        close();
-        const id = newId();
-        try {
-          await savePreset({ id, name, rule: slot.rule!, description: '' });
-          const next = clone(state.assignments.get(aid)!);
-          next.slots[i] = { ...next.slots[i], mode: 'preset', presetId: id, rule: null };
-          await saveAssignment(next);
-          toast(`Saved “${name}” and applied it to ${slot.name}.`);
-          audit(me(), 'Saved preset from slot', name);
-        } catch (e) {
-          toast(e instanceof StoreError ? e.message : 'Could not save.', 'error');
+function assignmentJson(db: DB, id: number) {
+  const { assignments } = loadAssignments(db);
+  const a = assignments.get(id);
+  if (!a) return null;
+  const row = get<{ default_preset_id: number | null }>(db, 'SELECT default_preset_id FROM assignments WHERE id = ?', id)!;
+  const presets = loadPresets(db);
+  const dp = row.default_preset_id != null ? presets.get(row.default_preset_id) : undefined;
+  const custom = new Map(
+    all<{ id: number; custom_rule_json: string | null }>(db, 'SELECT id, custom_rule_json FROM slots WHERE assignment_id = ?', id).map((s) => [s.id, s.custom_rule_json]),
+  );
+  return {
+    id: a.id,
+    code: a.code,
+    kind: a.kind,
+    displayName: a.displayName,
+    active: a.active,
+    sortOrder: a.sortOrder,
+    openByDefault: a.openByDefault,
+    startTime: a.startTime,
+    endTime: a.endTime,
+    defaultPreset: dp ? { id: dp.id, name: dp.name, criteria: describe(dp.rule) } : null,
+    slotCount: a.slots.length,
+    slots: a.slots.map((s) => ({
+      id: s.id,
+      position: s.position,
+      name: s.name,
+      criteria: {
+        mode: s.mode,
+        presetId: s.mode === 'preset' ? s.presetId : null,
+        rule: s.mode === 'custom' ? (JSON.parse(custom.get(s.id) ?? 'null') as Rule) : null,
+      },
+      // What actually applies, after defaults:
+      effective: { presetName: s.presetName, text: s.ruleText, rule: s.rule },
+      // 'default' = uses the assignment default; 'override' = a different saved preset; 'custom' = a one-off rule.
+      tag: s.mode === 'default' ? 'default' : s.mode === 'preset' ? 'override' : 'custom',
+    })),
+  };
+}
+
+function renumber(db: DB, assignmentId: number): void {
+  const ids = all<{ id: number }>(db, 'SELECT id FROM slots WHERE assignment_id = ? ORDER BY position, id', assignmentId);
+  ids.forEach((s, i) => run(db, 'UPDATE slots SET position = ? WHERE id = ?', i + 1, s.id));
+}
+
+function futureEntries(db: DB, slotIds: number[]): number {
+  if (!slotIds.length) return 0;
+  return get<{ n: number }>(
+    db,
+    `SELECT COUNT(*) AS n FROM schedule_entries WHERE date >= ? AND slot_id IN (${slotIds.map(() => '?').join(',')})`,
+    todayIso(),
+    ...slotIds,
+  )!.n;
+}
+
+function readTimes(b: Body): { start?: string | null; end?: string | null } {
+  const out: { start?: string | null; end?: string | null } = {};
+  if (has(b, 'startTime')) out.start = b.startTime === null ? null : str(b, 'startTime', { pattern: TIME });
+  if (has(b, 'endTime')) out.end = b.endTime === null ? null : str(b, 'endTime', { pattern: TIME });
+  return out;
+}
+
+// ---------- routes ----------
+
+export function registerAssignments(r: Router, db: DB): void {
+  // ----- presets -----
+
+  const usage = (presetId: number) => {
+    const rows = all<{ id: number; display_name: string; default_preset_id: number | null }>(db, 'SELECT id, display_name, default_preset_id FROM assignments');
+    const defaults = new Map(rows.map((a) => [a.id, a.default_preset_id]));
+    const names = new Map(rows.map((a) => [a.id, a.display_name]));
+    return {
+      assignmentDefaults: rows.filter((a) => a.default_preset_id === presetId).map((a) => ({ assignmentId: a.id, assignment: a.display_name })),
+      slots: [...loadAssignments(db).slots.values()]
+        .filter((s) => (s.mode === 'preset' ? s.presetId === presetId : s.mode === 'default' && defaults.get(s.assignmentId) === presetId))
+        .map((s) => ({
+          slotId: s.id,
+          assignmentId: s.assignmentId,
+          label: `${names.get(s.assignmentId)} · ${s.name}`,
+          how: s.mode === 'preset' ? 'override' : 'assignment default',
+        })),
+    };
+  };
+
+  r.get('/api/presets', ADMIN, () =>
+    [...loadPresets(db).values()].map((p) => {
+      const u = usage(p.id);
+      return { id: p.id, name: p.name, description: p.description, rule: p.rule, text: describe(p.rule), usedBySlots: u.slots.length };
+    }),
+  );
+
+  r.get('/api/presets/:id', ADMIN, (req) => {
+    const p = loadPresets(db).get(idParam(req.params.id));
+    if (!p) throw notFound('Criteria preset');
+    const people = [...loadPersonnel(db).values()].filter((x) => x.active);
+    const qualifying = people.filter((x) => evaluate(p.rule, x.certs)).map((x) => ({ personnelId: x.id, lgNumber: x.lgNumber, name: x.name }));
+    return { id: p.id, name: p.name, description: p.description, rule: p.rule, text: describe(p.rule), usage: usage(p.id), qualifying, activeTotal: people.length };
+  });
+
+  // Live preview while editing a rule.
+  r.post('/api/presets/preview', ADMIN, (req) => {
+    const b = obj(req.body);
+    const rule = ruleFrom(db, b.rule);
+    const people = [...loadPersonnel(db).values()].filter((x) => x.active);
+    const qualifying = people.filter((x) => evaluate(rule, x.certs)).map((x) => ({ personnelId: x.id, lgNumber: x.lgNumber, name: x.name }));
+    return { rule, text: describe(rule), qualifying, count: qualifying.length, activeTotal: people.length };
+  });
+
+  r.post('/api/presets', ADMIN, (req) => {
+    const b = obj(req.body);
+    const name = str(b, 'name', { max: 80 });
+    const rule = ruleFrom(db, b.rule);
+    const description = optStr(b, 'description', { min: 0, max: 300 }) ?? '';
+    const { lastId } = run(db, 'INSERT INTO criteria_presets (name, rule_json, description) VALUES (?, ?, ?)', name, JSON.stringify(rule), description);
+    audit(db, req.user.id, 'preset.create', { id: lastId, name });
+    return created({ id: lastId, name, description, rule, text: describe(rule) });
+  });
+
+  r.patch('/api/presets/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const p = loadPresets(db).get(id);
+    if (!p) throw notFound('Criteria preset');
+    const b = obj(req.body);
+    const name = optStr(b, 'name', { max: 80 }) ?? p.name;
+    const rule = has(b, 'rule') ? ruleFrom(db, b.rule) : p.rule;
+    const description = optStr(b, 'description', { min: 0, max: 300 }) ?? p.description;
+    run(db, 'UPDATE criteria_presets SET name = ?, rule_json = ?, description = ? WHERE id = ?', name, JSON.stringify(rule), description, id);
+    audit(db, req.user.id, 'preset.update', { id });
+    return { id, name, description, rule, text: describe(rule), usage: usage(id) };
+  });
+
+  r.delete('/api/presets/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    if (!loadPresets(db).has(id)) throw notFound('Criteria preset');
+    const u = usage(id);
+    if ((u.slots.length || u.assignmentDefaults.length) && req.query.get('force') !== 'true') {
+      throw new HttpError(409, 'preset_in_use', 'This preset is in use. Pass ?force=true to delete it; those slots will fall back to their assignment default (or no requirement).', u);
+    }
+    tx(db, () => {
+      run(db, "UPDATE slots SET criteria_mode = 'default', preset_id = NULL WHERE criteria_mode = 'preset' AND preset_id = ?", id);
+      run(db, 'DELETE FROM criteria_presets WHERE id = ?', id);
+      audit(db, req.user.id, 'preset.delete', { id });
+    });
+    return { ok: true };
+  });
+
+  // ----- assignments -----
+
+  r.get('/api/assignments', ADMIN, (req) => {
+    const kind = req.query.get('kind');
+    const ids = all<{ id: number }>(db, 'SELECT id FROM assignments ORDER BY sort_order, id');
+    return ids.map((a) => assignmentJson(db, a.id)!).filter((a) => !kind || a.kind === kind);
+  });
+
+  r.get('/api/assignments/:id', ADMIN, (req) => assignmentJson(db, idParam(req.params.id)) ?? (() => { throw notFound('Assignment'); })());
+
+  r.post('/api/assignments', ADMIN, (req) => {
+    const b = obj(req.body);
+    const code = str(b, 'code', { max: 30, pattern: /^[A-Za-z0-9_-]+$/ });
+    const kind = oneOf(b, 'kind', KINDS);
+    const displayName = str(b, 'displayName', { max: 60 });
+    const slotCount = optInt(b, 'slotCount', { min: 0, max: 30 }) ?? 1;
+    const defaultPresetId = has(b, 'defaultPresetId') && b.defaultPresetId !== null ? int(b, 'defaultPresetId', { min: 1 }) : null;
+    const t = readTimes(b);
+    const id = tx(db, () => {
+      const sort = optInt(b, 'sortOrder') ?? get<{ m: number }>(db, 'SELECT COALESCE(MAX(sort_order), 0) + 10 AS m FROM assignments')!.m;
+      const { lastId } = run(
+        db,
+        'INSERT INTO assignments (code, kind, display_name, active, sort_order, default_preset_id, open_by_default, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        code,
+        kind,
+        displayName,
+        bool(optBool(b, 'active') ?? true),
+        sort,
+        defaultPresetId,
+        bool(optBool(b, 'openByDefault') ?? true),
+        t.start ?? null,
+        t.end ?? null,
+      );
+      for (let i = 1; i <= slotCount; i++) run(db, 'INSERT INTO slots (assignment_id, position, name) VALUES (?, ?, ?)', lastId, i, `Slot ${i}`);
+      audit(db, req.user.id, 'assignment.create', { id: lastId, code });
+      return lastId;
+    });
+    return created(assignmentJson(db, id));
+  });
+
+  r.patch('/api/assignments/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    if (!get(db, 'SELECT id FROM assignments WHERE id = ?', id)) throw notFound('Assignment');
+    const b = obj(req.body);
+    tx(db, () => {
+      const name = optStr(b, 'displayName', { max: 60 });
+      if (name) run(db, 'UPDATE assignments SET display_name = ? WHERE id = ?', name, id);
+      const active = optBool(b, 'active');
+      if (active !== undefined) run(db, 'UPDATE assignments SET active = ? WHERE id = ?', bool(active), id);
+      const open = optBool(b, 'openByDefault');
+      if (open !== undefined) run(db, 'UPDATE assignments SET open_by_default = ? WHERE id = ?', bool(open), id);
+      const sort = optInt(b, 'sortOrder');
+      if (sort !== undefined) run(db, 'UPDATE assignments SET sort_order = ? WHERE id = ?', sort, id);
+      if (has(b, 'defaultPresetId')) {
+        const pid = b.defaultPresetId === null ? null : int(b, 'defaultPresetId', { min: 1 });
+        if (pid !== null && !get(db, 'SELECT id FROM criteria_presets WHERE id = ?', pid)) throw notFound('Criteria preset');
+        run(db, 'UPDATE assignments SET default_preset_id = ? WHERE id = ?', pid, id);
+      }
+      const t = readTimes(b);
+      if (t.start !== undefined) run(db, 'UPDATE assignments SET start_time = ? WHERE id = ?', t.start, id);
+      if (t.end !== undefined) run(db, 'UPDATE assignments SET end_time = ? WHERE id = ?', t.end, id);
+      audit(db, req.user.id, 'assignment.update', { id, fields: Object.keys(b) });
+    });
+    return assignmentJson(db, id);
+  });
+
+  r.delete('/api/assignments/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const slotIds = all<{ id: number }>(db, 'SELECT id FROM slots WHERE assignment_id = ?', id).map((s) => s.id);
+    const n = futureEntries(db, slotIds);
+    if (n && req.query.get('force') !== 'true') {
+      throw new HttpError(409, 'has_entries', `${n} upcoming assignments use this. Deactivate it instead, or pass ?force=true to delete them too.`);
+    }
+    const { changes } = run(db, 'DELETE FROM assignments WHERE id = ?', id);
+    if (!changes) throw notFound('Assignment');
+    audit(db, req.user.id, 'assignment.delete', { id });
+    return { ok: true };
+  });
+
+  // ----- slots -----
+
+  r.post('/api/assignments/:id/slots', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    if (!get(db, 'SELECT id FROM assignments WHERE id = ?', id)) throw notFound('Assignment');
+    const b = obj(req.body);
+    const criteria = has(b, 'criteria') ? parseCriteria(db, b.criteria) : null;
+    const slotId = tx(db, () => {
+      const pos = get<{ m: number }>(db, 'SELECT COALESCE(MAX(position), 0) + 1 AS m FROM slots WHERE assignment_id = ?', id)!.m;
+      const name = optStr(b, 'name', { max: 40 }) ?? `Slot ${pos}`;
+      const { lastId } = run(db, 'INSERT INTO slots (assignment_id, position, name) VALUES (?, ?, ?)', id, pos, name);
+      if (criteria) writeCriteria(db, lastId, criteria);
+      audit(db, req.user.id, 'slot.create', { assignmentId: id, slotId: lastId });
+      return lastId;
+    });
+    return created({ slotId, assignment: assignmentJson(db, id) });
+  });
+
+  // Set the number of slots: adds "Slot N" at the end or removes from the end.
+  r.put('/api/assignments/:id/slot-count', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    if (!get(db, 'SELECT id FROM assignments WHERE id = ?', id)) throw notFound('Assignment');
+    const count = int(obj(req.body), 'count', { min: 0, max: 30 });
+    tx(db, () => {
+      const slots = all<{ id: number }>(db, 'SELECT id FROM slots WHERE assignment_id = ? ORDER BY position, id', id);
+      if (count < slots.length) {
+        const removing = slots.slice(count).map((s) => s.id);
+        const n = futureEntries(db, removing);
+        if (n && req.query.get('force') !== 'true') {
+          throw new HttpError(409, 'has_entries', `The slots being removed have ${n} upcoming assignments. Pass ?force=true to remove them too.`);
         }
-      };
-    },
-  );
+        for (const sid of removing) run(db, 'DELETE FROM slots WHERE id = ?', sid);
+      } else {
+        for (let i = slots.length + 1; i <= count; i++) run(db, 'INSERT INTO slots (assignment_id, position, name) VALUES (?, ?, ?)', id, i, `Slot ${i}`);
+      }
+      renumber(db, id);
+      audit(db, req.user.id, 'assignment.slot_count', { id, count });
+    });
+    return assignmentJson(db, id);
+  });
+
+  r.put('/api/assignments/:id/slots/order', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const b = obj(req.body);
+    if (!Array.isArray(b.slotIds)) throw bad('slotIds', 'must be an array of slot ids in the new order');
+    const current = all<{ id: number }>(db, 'SELECT id FROM slots WHERE assignment_id = ?', id).map((s) => s.id);
+    const given = b.slotIds.map(Number);
+    if (given.length !== current.length || !current.every((sid) => given.includes(sid))) {
+      throw bad('slotIds', 'must list every slot of this assignment exactly once');
+    }
+    tx(db, () => given.forEach((sid, i) => run(db, 'UPDATE slots SET position = ? WHERE id = ?', i + 1, sid)));
+    audit(db, req.user.id, 'assignment.slot_order', { id, order: given });
+    return assignmentJson(db, id);
+  });
+
+  // Apply one preset to every slot (or reset all to the assignment default with presetId: null).
+  r.post('/api/assignments/:id/apply-preset', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    if (!get(db, 'SELECT id FROM assignments WHERE id = ?', id)) throw notFound('Assignment');
+    const b = obj(req.body);
+    const pid = b.presetId === null || b.presetId === undefined ? null : int(b, 'presetId', { min: 1 });
+    if (pid !== null && !get(db, 'SELECT id FROM criteria_presets WHERE id = ?', pid)) throw notFound('Criteria preset');
+    if (pid === null) run(db, "UPDATE slots SET criteria_mode = 'default', preset_id = NULL, custom_rule_json = NULL WHERE assignment_id = ?", id);
+    else run(db, "UPDATE slots SET criteria_mode = 'preset', preset_id = ?, custom_rule_json = NULL WHERE assignment_id = ?", pid, id);
+    audit(db, req.user.id, 'assignment.apply_preset', { id, presetId: pid });
+    return assignmentJson(db, id);
+  });
+
+  r.patch('/api/slots/:id', ADMIN, (req) => {
+    const sid = idParam(req.params.id);
+    const slot = get<{ assignment_id: number }>(db, 'SELECT assignment_id FROM slots WHERE id = ?', sid);
+    if (!slot) throw notFound('Slot');
+    const b = obj(req.body);
+    tx(db, () => {
+      const name = optStr(b, 'name', { max: 40 });
+      if (name) run(db, 'UPDATE slots SET name = ? WHERE id = ?', name, sid);
+      if (has(b, 'criteria')) writeCriteria(db, sid, parseCriteria(db, b.criteria));
+      audit(db, req.user.id, 'slot.update', { slotId: sid, fields: Object.keys(b) });
+    });
+    return assignmentJson(db, slot.assignment_id);
+  });
+
+  r.delete('/api/slots/:id', ADMIN, (req) => {
+    const sid = idParam(req.params.id);
+    const slot = get<{ assignment_id: number }>(db, 'SELECT assignment_id FROM slots WHERE id = ?', sid);
+    if (!slot) throw notFound('Slot');
+    const n = futureEntries(db, [sid]);
+    if (n && req.query.get('force') !== 'true') throw new HttpError(409, 'has_entries', `This slot has ${n} upcoming assignments. Pass ?force=true to remove them too.`);
+    tx(db, () => {
+      run(db, 'DELETE FROM slots WHERE id = ?', sid);
+      renumber(db, slot.assignment_id);
+      audit(db, req.user.id, 'slot.delete', { slotId: sid });
+    });
+    return assignmentJson(db, slot.assignment_id);
+  });
+
+  // Save the slot's current rule as a reusable preset and point the slot at it.
+  r.post('/api/slots/:id/save-as-preset', ADMIN, (req) => {
+    const sid = idParam(req.params.id);
+    const s = loadAssignments(db).slots.get(sid);
+    if (!s) throw notFound('Slot');
+    if (!s.rule) throw new HttpError(409, 'no_rule', 'This slot has no requirement to save.');
+    const name = str(obj(req.body), 'name', { max: 80 });
+    const presetId = tx(db, () => {
+      const { lastId } = run(db, 'INSERT INTO criteria_presets (name, rule_json) VALUES (?, ?)', name, JSON.stringify(s.rule));
+      writeCriteria(db, sid, { mode: 'preset', presetId: lastId });
+      audit(db, req.user.id, 'slot.save_as_preset', { slotId: sid, presetId: lastId });
+      return lastId;
+    });
+    return created({ presetId, name, text: describe(s.rule), assignment: assignmentJson(db, s.assignmentId) });
+  });
 }
 
-function addAssignment() {
-  modal(
-    html`<h2 class="h2">Add assignment</h2>
-      <div class="row2 fixed"><label class="field"><span>Type</span><select id="na-kind" class="input">${GROUPS.map((g) => html`<option value="${g.kind}">${g.label.replace(' · renameable', '')}</option>`)}</select></label>
-      <label class="field"><span>Slots</span><input id="na-slots" class="input" type="number" min="1" max="30" value="2"></label></div>
-      <label class="field"><span>Display name</span><input id="na-name" class="input" maxlength="60" autofocus></label><p class="error" id="na-err" hidden></p>
-      <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn primary" id="na-go">Add</button></div>`,
-    (root, close) => {
-      ($('#na-go', root) as HTMLButtonElement).onclick = async () => {
-        const name = ($('#na-name', root) as HTMLInputElement).value.trim();
-        const n = Math.min(30, Math.max(1, Number(($('#na-slots', root) as HTMLInputElement).value) || 1));
-        if (!name) return (($('#na-err', root)!.textContent = 'Enter a name.'), ($('#na-err', root)!.hidden = false));
-        close();
-        const order = Math.max(0, ...[...state.assignments.values()].map((a) => a.sortOrder)) + 10;
-        const a: AssignmentDef = {
-          id: newId(),
-          code: name.toUpperCase().replace(/[^A-Z0-9]+/g, '-'),
-          kind: ($('#na-kind', root) as HTMLSelectElement).value as AssignmentKind,
-          displayName: name,
-          active: true,
-          sortOrder: order,
-          defaultPresetId: [...state.presets.values()].find((p) => p.name === 'Basic Qualified')?.id ?? null,
-          openByDefault: true,
-          startTime: null,
-          endTime: null,
-          slots: Array.from({ length: n }, (_, i) => ({ id: newId(), name: `Slot ${i + 1}`, mode: 'default' as const, presetId: null, rule: null })),
-        };
-        await save(a, `${name} added.`);
-        audit(me(), 'Added assignment', name);
-        local.selected = a.id;
-        rerender(true);
-      };
-    },
-  );
-}
+export { optOneOf };

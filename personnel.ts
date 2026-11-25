@@ -1,234 +1,242 @@
-// Personnel profiles: name, LG number, active, label color, certifications, regular days off, assignments.
+// Personnel profiles, certifications and certification equivalencies.
 
-import { evaluate, missing } from '../../../src/domain/criteria.ts';
-import { WEEKDAYS, weekDates } from '../../../src/domain/dates.ts';
-import { availability } from '../../../src/domain/scheduling.ts';
-import { rerender, ui } from '../app-state.ts';
-import { me, personnelCtx, sortedPeople, weekView } from '../model.ts';
-import { audit, deletePerson, savePerson, state, StoreError, type Person } from '../store.ts';
-import { $, $$, DAY_LONG, DAY_SHORT, html, icon, LABEL_COLORS, LABEL_NAMES, modal, newId, raw, shortDate, toast, type Raw } from '../util.ts';
-import { fmtWeek } from './schedule.ts';
+import { all, audit, bool, get, run, tx, type DB } from '../db/index.ts';
+import { evaluate, missing } from '../domain/criteria.ts';
+import { WEEKDAYS, weekDates, weekStartOf, todayIso } from '../domain/dates.ts';
+import { ADMIN, created, HttpError, noContent, type Router } from '../http/app.ts';
+import { bad, has, idParam, int, notFound, obj, optBool, optInt, optOneOf, optStr, str, type Body } from '../http/validate.ts';
+import { knownCertCodes, loadEquivalencies, loadPersonnel, loadPresets } from '../services/context.ts';
+import { entriesForPerson } from '../services/week.ts';
 
-const local = { selected: null as number | null, q: '', filter: 'active' as 'active' | 'inactive' | 'all', cert: '' };
+export const LABEL_COLORS = ['red', 'light_blue', 'green', 'dark_blue', 'white'] as const;
 const LG = /^LG\d{1,4}$/i;
+const CERT_CODE = /^[A-Z0-9][A-Z0-9_-]{0,15}$/;
 
-async function save(p: Person, msg?: string) {
-  try {
-    await savePerson(p);
-    if (msg) toast(msg);
-  } catch (e) {
-    toast(e instanceof StoreError ? e.message : 'Could not save.', 'error');
+export function personJson(db: DB, id: number) {
+  const p = get<{ id: number; lg_number: string; name: string; active: number; label_color: string; created_at: string; updated_at: string }>(
+    db,
+    'SELECT * FROM personnel WHERE id = ?',
+    id,
+  );
+  if (!p) return null;
+  const certs = all<{ cert_code: string }>(
+    db,
+    'SELECT pc.cert_code FROM personnel_certs pc JOIN certifications c ON c.code = pc.cert_code WHERE pc.personnel_id = ? ORDER BY c.sort_order, c.code',
+    id,
+  ).map((r) => r.cert_code);
+  const days = all<{ weekday: number }>(db, 'SELECT weekday FROM personnel_days_off WHERE personnel_id = ? ORDER BY weekday', id).map(
+    (r) => WEEKDAYS[r.weekday],
+  );
+  return {
+    id: p.id,
+    lgNumber: p.lg_number,
+    name: p.name,
+    active: p.active === 1,
+    labelColor: p.label_color,
+    certifications: certs,
+    regularDaysOff: days,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+}
+
+function parseDaysOff(v: unknown): number[] {
+  if (!Array.isArray(v)) throw bad('regularDaysOff', `must be an array of ${WEEKDAYS.join(', ')}`);
+  const out = new Set<number>();
+  for (const d of v) {
+    const i = WEEKDAYS.indexOf(String(d).toLowerCase().slice(0, 3) as (typeof WEEKDAYS)[number]);
+    if (i < 0) throw bad('regularDaysOff', `contains "${d}"; use ${WEEKDAYS.join(', ')}`);
+    out.add(i);
+  }
+  return [...out];
+}
+
+function parseCerts(db: DB, v: unknown): string[] {
+  if (!Array.isArray(v)) throw bad('certifications', 'must be an array of certification codes');
+  const known = knownCertCodes(db);
+  const out = new Set<string>();
+  for (const c of v) {
+    const code = String(c).trim().toUpperCase();
+    if (!known.has(code)) throw bad('certifications', `contains unknown certification "${c}"`);
+    out.add(code);
+  }
+  return [...out];
+}
+
+function writePersonDetails(db: DB, id: number, b: Body): void {
+  if (has(b, 'certifications')) {
+    const certs = parseCerts(db, b.certifications);
+    run(db, 'DELETE FROM personnel_certs WHERE personnel_id = ?', id);
+    for (const c of certs) run(db, 'INSERT INTO personnel_certs (personnel_id, cert_code) VALUES (?, ?)', id, c);
+  }
+  if (has(b, 'regularDaysOff')) {
+    const days = parseDaysOff(b.regularDaysOff);
+    run(db, 'DELETE FROM personnel_days_off WHERE personnel_id = ?', id);
+    for (const d of days) run(db, 'INSERT INTO personnel_days_off (personnel_id, weekday) VALUES (?, ?)', id, d);
   }
 }
 
-function list(): Raw {
-  const q = local.q.trim().toLowerCase();
-  const people = sortedPeople().filter(
-    (p) =>
-      (local.filter === 'all' || (local.filter === 'active' ? p.active : !p.active)) &&
-      (!local.cert || p.certs.includes(local.cert)) &&
-      (!q || p.lgNumber.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)),
-  );
-  const count = (f: 'active' | 'inactive') => [...state.personnel.values()].filter((p) => (f === 'active' ? p.active : !p.active)).length;
-  return html`<aside class="list-pane" aria-label="Personnel list">
-    <div class="pane-head"><h1 class="h1">Personnel</h1><button type="button" class="btn primary small" id="add-person">${icon('plus', 14)} Add</button></div>
-    <label class="search">${icon('search', 15)}<input type="search" id="p-q" placeholder="Search LG # or name" aria-label="Search personnel" value="${local.q}"></label>
-    <div class="filters">
-      <button type="button" class="fchip${local.filter === 'active' ? ' on' : ''}" data-f="active">Active · ${count('active')}</button>
-      <button type="button" class="fchip${local.filter === 'inactive' ? ' on' : ''}" data-f="inactive">Inactive · ${count('inactive')}</button>
-      <select id="p-cert" class="input small" aria-label="Filter by certification"><option value="">Any certification</option>${(state.certs?.list ?? []).map((c) => html`<option value="${c.code}" ${local.cert === c.code ? raw('selected') : ''}>${c.name}</option>`)}</select>
-    </div>
-    <div class="plist" data-keep-scroll="plist">
-      ${people.map(
-        (p) => html`<button type="button" class="pitem${p.id === local.selected ? ' on' : ''}${p.active ? '' : ' inactive'}" data-pid="${p.id}">
-          <span class="chip lc-${p.labelColor}">${p.lgNumber}</span>
-          <span class="pmain"><span class="pname">${p.name}</span><span class="pcerts">${p.certs.join(' ') || 'No certifications'}</span></span>
-          ${p.active ? '' : html`<span class="tag">Inactive</span>`}
-        </button>`,
-      )}
-      ${people.length ? '' : html`<p class="muted small pad">${state.personnel.size ? 'No one matches these filters.' : 'No lifeguards yet. Add the first one.'}</p>`}
-    </div>
-  </aside>`;
-}
+export function registerPersonnel(r: Router, db: DB): void {
+  // ----- personnel -----
 
-function profile(p: Person): Raw {
-  const ctx = personnelCtx().get(p.id)!;
-  const certList = state.certs?.list ?? [];
-  const week = weekView(ui.weekStart);
-  const dates = weekDates(ui.weekStart);
-  const shifts = dates.map((d, i) => {
-    const day = week.days[i];
-    const mine = day.assignments.flatMap((a) => a.slots.filter((s) => s.entry?.personnelId === p.id).map((s) => ({ a, s })));
-    const av = availability(ctx, d);
-    return { d, i, mine, av };
+  r.get('/api/personnel', ADMIN, (req) => {
+    const active = req.query.get('active');
+    const q = (req.query.get('q') ?? '').trim().toLowerCase();
+    const cert = (req.query.get('cert') ?? '').trim().toUpperCase();
+    const ids = all<{ id: number }>(db, 'SELECT id FROM personnel ORDER BY CAST(SUBSTR(lg_number, 3) AS INTEGER), lg_number');
+    return ids
+      .map((row) => personJson(db, row.id)!)
+      .filter((p) => (active === 'true' ? p.active : active === 'false' ? !p.active : true))
+      .filter((p) => !q || p.lgNumber.toLowerCase().includes(q) || p.name.toLowerCase().includes(q))
+      .filter((p) => !cert || p.certifications.includes(cert));
   });
-  const upcoming = [...state.timeOff.values()].filter((t) => t.personnelId === p.id && t.endDate >= dates[0]).sort((a, b) => a.startDate.localeCompare(b.startDate));
-  return html`<section class="detail" aria-label="Profile for ${p.lgNumber}">
-    <div class="profile-head">
-      <span class="avatar chip lc-${p.labelColor}">${p.lgNumber}</span>
-      <div class="grow1"><h2 class="h1">${p.name}</h2><p class="muted">${p.certs.length} certifications · ${p.daysOff.length ? `regular days off ${p.daysOff.map((d) => DAY_SHORT[WEEKDAYS[d]]).join(', ')}` : 'no regular days off'} · ${shifts.reduce((n, s) => n + s.mine.length, 0)} shifts this week</p></div>
-      <label class="switch"><input type="checkbox" id="p-active" ${p.active ? raw('checked') : ''}><span class="track" aria-hidden="true"></span>Active</label>
-    </div>
-    <div class="cards2">
-      <section class="card">
-        <h3 class="h3">Identity</h3>
-        <div class="row2 fixed">
-          <label class="field"><span>Name</span><input id="p-name" class="input" value="${p.name}" maxlength="120"></label>
-          <label class="field"><span>LG number</span><input id="p-lg" class="input mono" value="${p.lgNumber}" maxlength="7"></label>
-        </div>
-        <p class="error small" id="p-lg-err" hidden></p>
-        <div class="field"><span>Label color on the schedule</span>
-          <div class="swatches" role="radiogroup" aria-label="Label color">${LABEL_COLORS.map(
-            (c) => html`<button type="button" role="radio" aria-checked="${p.labelColor === c}" class="swatch${p.labelColor === c ? ' on' : ''}" data-color="${c}"><span class="chip lc-${c}">${p.lgNumber}</span>${LABEL_NAMES[c]}</button>`,
-          )}</div>
-        </div>
-      </section>
-      <section class="card">
-        <div class="card-head"><h3 class="h3">Regular days off</h3><a href="#timeoff" class="small">Add one-time time off</a></div>
-        <div class="days7" role="group" aria-label="Weekly pattern">${WEEKDAYS.map(
-          (w, i) => html`<button type="button" class="dayt${p.daysOff.includes(i) ? ' off' : ''}" data-day="${i}" aria-pressed="${p.daysOff.includes(i)}">${DAY_SHORT[w]}<span>${p.daysOff.includes(i) ? 'Off' : 'Works'}</span></button>`,
-        )}</div>
-        <p class="muted small">Repeats every week.${upcoming.length ? html` Upcoming: ${upcoming.slice(0, 3).map((t, i) => html`${i ? ', ' : ''}<strong class="warntext">${t.type.replace('_', ' ')} ${shortDate(t.startDate)}${t.endDate !== t.startDate ? `–${shortDate(t.endDate)}` : ''}</strong>`)}` : ''}</p>
-      </section>
-    </div>
-    <section class="card">
-      <div class="card-head"><h3 class="h3">Certifications</h3><span class="muted small">Click to add or remove. Each one is independent; holding EMT2 doesn't count as EMT unless an equivalency rule says so.</span><a href="#criteria" class="small">Equivalency rules: ${(state.certs?.equivalencies ?? []).filter((e) => e.enabled).length || 'Off'}</a></div>
-      <div class="cert-row">${certList.map((c) => {
-        const on = p.certs.includes(c.code);
-        return html`<button type="button" class="cert${on ? ' on' : ''}" data-cert="${c.code}" aria-pressed="${on}">${icon(on ? 'check' : 'plus', 13)} ${c.name}</button>`;
-      })}</div>
-      <div class="quals"><span class="lbl">Qualifies for saved criteria</span><div class="qual-row">${[...state.presets.values()]
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((pr) => {
-          const ok = evaluate(pr.rule, ctx.certs);
-          return html`<span class="qual${ok ? ' ok' : ''}">${icon(ok ? 'check' : 'x', 12)} ${pr.name}${ok ? '' : html` <span class="muted">· needs ${missing(pr.rule, ctx.certs).join('; ')}</span>`}</span>`;
-        })}</div></div>
-    </section>
-    <section class="card">
-      <div class="card-head"><h3 class="h3">Assignments · ${fmtWeek(ui.weekStart)}</h3><a href="#schedule" class="small">Open in schedule</a></div>
-      <div class="table-wrap"><table class="tbl"><tbody>${shifts.map(
-        (s) => html`<tr><th scope="row">${DAY_LONG[WEEKDAYS[s.i]]}</th><td>${
-          s.mine.length
-            ? s.mine.map(({ a, s: sl }) => html`<div>${a.displayName} · ${sl.name} ${sl.entry?.locked ? icon('lock', 11, 'Locked') : ''}</div>`)
-            : s.av.available
-              ? html`<span class="muted">Unassigned</span>`
-              : html`<span class="muted">${s.av.reason === 'regular_day_off' ? 'Regular day off' : String(s.av.reason).replace('_', ' ')}</span>`
-        }</td><td class="muted small">${s.mine.map(({ s: sl }) => sl.criteria).join(', ')}</td></tr>`,
-      )}</tbody></table></div>
-    </section>
-    <div class="danger-row"><button type="button" class="btn small ghost danger" id="p-del">${icon('trash', 13)} Delete ${p.lgNumber}</button><span class="muted small">To keep history, mark inactive instead.</span></div>
-  </section>`;
+
+  r.get('/api/personnel/:id', ADMIN, (req) => personJson(db, idParam(req.params.id)) ?? (() => { throw notFound('Lifeguard'); })());
+
+  r.post('/api/personnel', ADMIN, (req) => {
+    const b = obj(req.body);
+    const lg = str(b, 'lgNumber', { max: 10, pattern: LG }).toUpperCase();
+    const name = str(b, 'name', { max: 120 });
+    const active = optBool(b, 'active') ?? true;
+    const color = optOneOf(b, 'labelColor', LABEL_COLORS) ?? 'white';
+    const id = tx(db, () => {
+      const { lastId } = run(db, 'INSERT INTO personnel (lg_number, name, active, label_color) VALUES (?, ?, ?, ?)', lg, name, bool(active), color);
+      writePersonDetails(db, lastId, b);
+      audit(db, req.user.id, 'personnel.create', { id: lastId, lg });
+      return lastId;
+    });
+    return created(personJson(db, id));
+  });
+
+  r.patch('/api/personnel/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const b = obj(req.body);
+    if (!get(db, 'SELECT id FROM personnel WHERE id = ?', id)) throw notFound('Lifeguard');
+    tx(db, () => {
+      const lg = optStr(b, 'lgNumber', { max: 10, pattern: LG });
+      if (lg) run(db, 'UPDATE personnel SET lg_number = ? WHERE id = ?', lg.toUpperCase(), id);
+      const name = optStr(b, 'name', { max: 120 });
+      if (name) run(db, 'UPDATE personnel SET name = ? WHERE id = ?', name, id);
+      const active = optBool(b, 'active');
+      if (active !== undefined) run(db, 'UPDATE personnel SET active = ? WHERE id = ?', bool(active), id);
+      const color = optOneOf(b, 'labelColor', LABEL_COLORS);
+      if (color) run(db, 'UPDATE personnel SET label_color = ? WHERE id = ?', color, id);
+      writePersonDetails(db, id, b);
+      run(db, "UPDATE personnel SET updated_at = datetime('now') WHERE id = ?", id);
+      audit(db, req.user.id, 'personnel.update', { id, fields: Object.keys(b) });
+    });
+    return personJson(db, id);
+  });
+
+  r.delete('/api/personnel/:id', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const { changes } = run(db, 'DELETE FROM personnel WHERE id = ?', id);
+    if (!changes) throw notFound('Lifeguard');
+    audit(db, req.user.id, 'personnel.delete', { id });
+    return noContent();
+  });
+
+  // Add / remove a single certification.
+  r.put('/api/personnel/:id/certifications/:code', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const code = req.params.code.toUpperCase();
+    if (!knownCertCodes(db).has(code)) throw notFound(`Certification ${code}`);
+    if (!get(db, 'SELECT id FROM personnel WHERE id = ?', id)) throw notFound('Lifeguard');
+    run(db, 'INSERT OR IGNORE INTO personnel_certs (personnel_id, cert_code) VALUES (?, ?)', id, code);
+    audit(db, req.user.id, 'personnel.cert.add', { id, code });
+    return personJson(db, id);
+  });
+
+  r.delete('/api/personnel/:id/certifications/:code', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    run(db, 'DELETE FROM personnel_certs WHERE personnel_id = ? AND cert_code = ?', id, req.params.code.toUpperCase());
+    audit(db, req.user.id, 'personnel.cert.remove', { id, code: req.params.code.toUpperCase() });
+    return personJson(db, id) ?? (() => { throw notFound('Lifeguard'); })();
+  });
+
+  // Which saved criteria this lifeguard meets (and what's missing for the rest).
+  r.get('/api/personnel/:id/qualifications', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const person = loadPersonnel(db).get(id);
+    if (!person) throw notFound('Lifeguard');
+    return [...loadPresets(db).values()].map((p) => ({
+      presetId: p.id,
+      name: p.name,
+      qualifies: evaluate(p.rule, person.certs),
+      missing: missing(p.rule, person.certs),
+    }));
+  });
+
+  // Assigned shifts and positions for a week.
+  r.get('/api/personnel/:id/shifts', ADMIN, (req) => {
+    const id = idParam(req.params.id);
+    const start = weekStartOf(req.query.get('week') ?? todayIso());
+    return { weekStart: start, days: entriesForPerson(db, id, weekDates(start)) };
+  });
+
+  // ----- certifications -----
+
+  r.get('/api/certifications', ADMIN, () => ({
+    certifications: all<{ code: string; name: string; sort_order: number }>(db, 'SELECT * FROM certifications ORDER BY sort_order, code').map((c) => ({
+      code: c.code,
+      name: c.name,
+      sortOrder: c.sort_order,
+    })),
+    equivalencies: all<{ id: number; holder_code: string; satisfies_code: string; enabled: number }>(
+      db,
+      'SELECT * FROM cert_equivalencies ORDER BY holder_code, satisfies_code',
+    ).map((e) => ({ id: e.id, holder: e.holder_code, satisfies: e.satisfies_code, enabled: e.enabled === 1 })),
+  }));
+
+  r.post('/api/certifications', ADMIN, (req) => {
+    const b = obj(req.body);
+    const code = str(b, 'code', { max: 16 }).toUpperCase();
+    if (!CERT_CODE.test(code)) throw bad('code', 'may use letters, digits, - and _ (max 16)');
+    const name = optStr(b, 'name', { max: 80 }) ?? code;
+    const sortOrder = optInt(b, 'sortOrder') ?? (get<{ m: number }>(db, 'SELECT COALESCE(MAX(sort_order), 0) + 1 AS m FROM certifications')!.m);
+    run(db, 'INSERT INTO certifications (code, name, sort_order) VALUES (?, ?, ?)', code, name, sortOrder);
+    audit(db, req.user.id, 'cert.create', { code });
+    return created({ code, name, sortOrder });
+  });
+
+  r.patch('/api/certifications/:code', ADMIN, (req) => {
+    const b = obj(req.body);
+    const code = req.params.code.toUpperCase();
+    if (!get(db, 'SELECT code FROM certifications WHERE code = ?', code)) throw notFound(`Certification ${code}`);
+    const name = optStr(b, 'name', { max: 80 });
+    if (name) run(db, 'UPDATE certifications SET name = ? WHERE code = ?', name, code);
+    const sortOrder = optInt(b, 'sortOrder');
+    if (sortOrder !== undefined) run(db, 'UPDATE certifications SET sort_order = ? WHERE code = ?', sortOrder, code);
+    return get(db, 'SELECT code, name, sort_order AS sortOrder FROM certifications WHERE code = ?', code);
+  });
+
+  // Replace the full list of equivalency rules.
+  r.put('/api/certifications/equivalencies', ADMIN, (req) => {
+    const b = obj(req.body);
+    if (!Array.isArray(b.items)) throw bad('items', 'must be an array of { holder, satisfies, enabled }');
+    const known = knownCertCodes(db);
+    const items = b.items.map((raw, i) => {
+      const it = obj(raw, `items[${i}]`);
+      const holder = str(it, 'holder').toUpperCase();
+      const satisfies = str(it, 'satisfies').toUpperCase();
+      if (!known.has(holder)) throw bad(`items[${i}].holder`, `is not a known certification`);
+      if (!known.has(satisfies)) throw bad(`items[${i}].satisfies`, `is not a known certification`);
+      if (holder === satisfies) throw bad(`items[${i}]`, 'cannot map a certification to itself');
+      return { holder, satisfies, enabled: optBool(it, 'enabled') ?? false };
+    });
+    tx(db, () => {
+      run(db, 'DELETE FROM cert_equivalencies');
+      for (const it of items) {
+        run(db, 'INSERT INTO cert_equivalencies (holder_code, satisfies_code, enabled) VALUES (?, ?, ?)', it.holder, it.satisfies, bool(it.enabled));
+      }
+      audit(db, req.user.id, 'cert.equivalencies', { items });
+    });
+    return { equivalencies: items, active: loadEquivalencies(db) };
+  });
 }
 
-export const personnelView = {
-  render(): Raw {
-    const sel = local.selected != null ? state.personnel.get(local.selected) : undefined;
-    if (!sel) local.selected = sortedPeople().find((p) => p.active)?.id ?? sortedPeople()[0]?.id ?? null;
-    const p = local.selected != null ? state.personnel.get(local.selected) : undefined;
-    return html`<div class="master">${list()}${p ? profile(p) : html`<section class="detail"><div class="empty-state"><p>Add your first lifeguard to start building schedules.</p></div></section>`}</div>`;
-  },
-  bind(root: HTMLElement): void {
-    $('#add-person', root)!.onclick = addPerson;
-    const q = $('#p-q', root) as HTMLInputElement;
-    q.oninput = () => {
-      local.q = q.value;
-      const s = q.value.trim().toLowerCase();
-      $$('.pitem', root).forEach((el) => {
-        const p = state.personnel.get(Number(el.dataset.pid))!;
-        el.hidden = !!s && !(p.lgNumber.toLowerCase().includes(s) || p.name.toLowerCase().includes(s));
-      });
-    };
-    $$('[data-f]', root).forEach((b) => (b.onclick = () => ((local.filter = b.dataset.f as typeof local.filter), rerender(true))));
-    ($('#p-cert', root) as HTMLSelectElement).onchange = (e) => ((local.cert = (e.target as HTMLSelectElement).value), rerender(true));
-    $$('.pitem', root).forEach((b) => (b.onclick = () => ((local.selected = Number(b.dataset.pid)), rerender(true))));
-    const p = local.selected != null ? state.personnel.get(local.selected) : undefined;
-    if (!p) return;
-    const upd = (patch: Partial<Person>, msg?: string) => save({ ...p, ...patch }, msg);
-    ($('#p-active', root) as HTMLInputElement).onchange = (e) => {
-      const on = (e.target as HTMLInputElement).checked;
-      upd({ active: on }, on ? `${p.lgNumber} is active.` : `${p.lgNumber} marked inactive.`);
-      audit(me(), on ? 'Activated' : 'Deactivated', p.lgNumber);
-    };
-    ($('#p-name', root) as HTMLInputElement).onchange = (e) => {
-      const v = (e.target as HTMLInputElement).value.trim();
-      if (v) upd({ name: v }, 'Name saved.');
-    };
-    ($('#p-lg', root) as HTMLInputElement).onchange = (e) => {
-      const v = (e.target as HTMLInputElement).value.trim().toUpperCase();
-      const err = $('#p-lg-err', root)!;
-      if (!LG.test(v)) {
-        err.textContent = 'Use the format LG followed by a number, like LG20.';
-        err.hidden = false;
-        return;
-      }
-      if ([...state.personnel.values()].some((x) => x.id !== p.id && x.lgNumber.toUpperCase() === v)) {
-        err.textContent = `${v} is already used by another lifeguard.`;
-        err.hidden = false;
-        return;
-      }
-      err.hidden = true;
-      upd({ lgNumber: v }, `LG number changed to ${v}.`);
-      audit(me(), 'Changed LG number', `${p.lgNumber} → ${v}`);
-    };
-    $$('[data-color]', root).forEach((b) => (b.onclick = () => upd({ labelColor: b.dataset.color as Person['labelColor'] })));
-    $$('[data-day]', root).forEach(
-      (b) =>
-        (b.onclick = () => {
-          const d = Number(b.dataset.day);
-          upd({ daysOff: p.daysOff.includes(d) ? p.daysOff.filter((x) => x !== d) : [...p.daysOff, d].sort() });
-        }),
-    );
-    $$('[data-cert]', root).forEach(
-      (b) =>
-        (b.onclick = () => {
-          const c = b.dataset.cert!;
-          const has = p.certs.includes(c);
-          upd({ certs: has ? p.certs.filter((x) => x !== c) : [...p.certs, c] }, `${has ? 'Removed' : 'Added'} ${c} for ${p.lgNumber}.`);
-          audit(me(), has ? 'Removed certification' : 'Added certification', `${c} · ${p.lgNumber}`);
-        }),
-    );
-    $('#p-del', root)!.onclick = () =>
-      modal(html`<h2 class="h2">Delete ${p.lgNumber} · ${p.name}?</h2><p>This removes the profile. Their past assignments will show as empty. To keep history, mark them inactive instead.</p><div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn danger" id="pd-go">Delete</button></div>`, (r, close) => {
-        ($('#pd-go', r) as HTMLButtonElement).onclick = async () => {
-          close();
-          try {
-            await deletePerson(p.id);
-            audit(me(), 'Deleted lifeguard', p.lgNumber);
-            local.selected = null;
-            toast(`${p.lgNumber} deleted.`);
-          } catch (e) {
-            toast(e instanceof StoreError ? e.message : 'Could not delete.', 'error');
-          }
-        };
-      });
-  },
-};
-
-function addPerson() {
-  const nextNum = Math.max(0, ...[...state.personnel.values()].map((p) => Number(p.lgNumber.replace(/\D/g, '')) || 0)) + 1;
-  modal(
-    html`<h2 class="h2">Add lifeguard</h2>
-      <div class="row2 fixed"><label class="field"><span>Name</span><input id="np-name" class="input" maxlength="120" autofocus></label><label class="field"><span>LG number</span><input id="np-lg" class="input mono" value="LG${nextNum}" maxlength="7"></label></div>
-      <p class="muted small">You can add certifications and days off on the profile next.</p>
-      <p class="error" id="np-err" hidden></p>
-      <div class="btn-row end"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn primary" id="np-go">Add lifeguard</button></div>`,
-    (root, close) => {
-      ($('#np-go', root) as HTMLButtonElement).onclick = async () => {
-        const name = ($('#np-name', root) as HTMLInputElement).value.trim();
-        const lg = ($('#np-lg', root) as HTMLInputElement).value.trim().toUpperCase();
-        const err = $('#np-err', root)!;
-        const fail = (m: string) => ((err.textContent = m), (err.hidden = false));
-        if (!name) return fail('Enter a name.');
-        if (!LG.test(lg)) return fail('Use the format LG followed by a number, like LG20.');
-        if ([...state.personnel.values()].some((x) => x.lgNumber.toUpperCase() === lg)) return fail(`${lg} is already in use.`);
-        const p: Person = { id: newId(), lgNumber: lg, name, active: true, labelColor: 'white', certs: state.certs?.list.some((c) => c.code === 'BASIC') ? ['BASIC'] : [], daysOff: [] };
-        close();
-        await save(p, `${lg} added.`);
-        audit(me(), 'Added lifeguard', lg);
-        local.selected = p.id;
-        local.filter = 'active';
-        rerender(true);
-      };
-    },
-  );
+export function requirePerson(db: DB, id: number): void {
+  if (!get(db, 'SELECT id FROM personnel WHERE id = ?', id)) throw new HttpError(404, 'not_found', 'Lifeguard not found.');
 }
+
+export { int };
